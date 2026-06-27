@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>StormScope UK — Live Weather Radar</title>
-  <meta name="description" content="Live UK weather radar. Track rain, storms, and lightning across Great Britain in real time.">
+  <meta name="description" content="Live UK weather radar. Track rain, storms, and severe weather across Great Britain in real time.">
   <meta name="theme-color" content="#050c1a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -405,6 +405,23 @@
       transition: all 0.14s; white-space: nowrap; flex-shrink: 0;
     }
     #speed-btn:hover { border-color: var(--blue); color: var(--blue); }
+    /* Live button */
+    #live-btn {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+      background: rgba(255,255,255,0.07); border: 1px solid var(--border);
+      border-radius: 6px; padding: 5px 10px; cursor: pointer;
+      color: var(--text-dim); transition: all 0.14s; white-space: nowrap;
+      display: flex; align-items: center; gap: 5px; flex-shrink: 0;
+    }
+    #live-btn:hover { border-color: var(--red); color: var(--red); }
+    #live-btn.live { background: rgba(239,68,68,0.12); border-color: var(--red); color: var(--red); }
+    .live-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: currentColor; flex-shrink: 0;
+    }
+    #live-btn.live .live-dot { animation: livePulse 1.2s ease-in-out infinite; }
+    @keyframes livePulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+
 
     /* Track area */
     #tl-outer { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -708,11 +725,6 @@
 
     <div class="layer-group">
       <div class="layer-group-label">Overlays</div>
-
-      <div class="layer-item" data-layer="lightning">
-        <span class="l-emoji">⚡</span><span class="l-name">Lightning</span>
-        <button class="tog" data-tog="lightning"></button>
-      </div>
       <div class="layer-item" data-layer="wind">
         <span class="l-emoji">💨</span><span class="l-name">Wind Speed</span>
         <button class="tog" data-tog="wind"></button>
@@ -788,6 +800,9 @@
   </div>
 
   <button id="speed-btn" title="Cycle playback speed">1×</button>
+  <button id="live-btn" title="Jump to latest data (End)">
+    <span class="live-dot"></span>LIVE
+  </button>
 
   <div id="tl-outer">
     <div id="tl-labels"></div>
@@ -853,6 +868,7 @@
         <div class="sc-row"><span class="kbd">+</span><span class="sc-desc">Zoom in</span></div>
         <div class="sc-row"><span class="kbd">−</span><span class="sc-desc">Zoom out</span></div>
         <div class="sc-row"><span class="kbd">?</span><span class="sc-desc">This dialog</span></div>
+        <div class="sc-row"><span class="kbd">End</span><span class="sc-desc">Jump to live</span></div>
         <div class="sc-row"><span class="kbd">Esc</span><span class="sc-desc">Close panels</span></div>
       </div>
     </div>
@@ -865,6 +881,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 'use strict';
+
+// 1×1 transparent PNG — used as errorTileUrl so failed tiles are silent
+const TRANSPARENT_TILE = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=';
 
 /* ── Configuration ──────────────────────────────────────────────────── */
 const CFG = {
@@ -880,8 +899,6 @@ const CFG = {
   REFRESH:       600_000,      // 10-min auto-refresh
   COLOR_NORMAL:  2,
   COLOR_STORM:   6,
-  BOLT_FADE:     30_000,       // 30-second lightning fade
-  BOLT_SIM_INT:  15_000,       // sim strike interval
 };
 
 const OWM_LAYERS = {
@@ -909,7 +926,7 @@ const S = {
   stormMode:    false,
   scheme:       CFG.COLOR_NORMAL,
   layers: {
-    radar: true, satellite: false, lightning: false,
+    radar: true, satellite: false,
     wind: false, pressure: false, temp: false, clouds: false,
   },
   opacity: { radar: 0.80, satellite: 0.60 },
@@ -918,11 +935,9 @@ const S = {
   userMarker:   null,
   animTimer:    null,
   dragging:     false,
-  wsLightning:  null,
-  simInterval:  null,
-  boltMarkers:  [],
   favs:         [],
   aborter:      null,
+  liveMode:     false,
 };
 
 const SPEEDS = [0.5, 1, 2, 4];
@@ -949,7 +964,7 @@ function initMap() {
   );
   BASE.topo = L.tileLayer(
     'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-    { attribution: '© <a href="https://opentopomap.org">OpenTopoMap</a>', subdomains: 'abc', maxZoom: 17 }
+    { attribution: '© <a href="https://opentopomap.org">OpenTopoMap</a>', subdomains: 'abc', maxZoom: 17, maxNativeZoom: 17 }
   );
   BASE.dark.addTo(MAP);
 
@@ -984,7 +999,9 @@ async function loadRV() {
     if (!S.frames.length) throw new Error('No radar frames');
 
     buildTimeline();
-    showFrame(S.pastCount - 1, true);
+    // If live mode is active, stay on latest frame; otherwise keep position
+    const targetIdx = S.liveMode ? S.pastCount - 1 : Math.min(S.frameIdx, S.frames.length - 1);
+    showFrame(targetIdx, true);
     setUpdTime();
   } catch(e) {
     if (e.name !== 'AbortError') {
@@ -1008,7 +1025,8 @@ function getRadarLayer(f) {
   if (!RCACHE[k]) {
     RCACHE[k] = L.tileLayer(radarURL(f), {
       tileSize: 512, zoomOffset: -1,
-      maxNativeZoom: 14,
+      maxNativeZoom: 8,  // URL zoom = map zoom - 1, capped at 7 — within RainViewer's range
+      errorTileUrl: TRANSPARENT_TILE,
       opacity: S.opacity.radar,
       attribution: '© RainViewer',
     });
@@ -1020,7 +1038,8 @@ function getSatLayer(f) {
   if (!SCACHE[k]) {
     SCACHE[k] = L.tileLayer(satURL(f), {
       tileSize: 512, zoomOffset: -1,
-      maxNativeZoom: 14,
+      maxNativeZoom: 8,
+      errorTileUrl: TRANSPARENT_TILE,
       opacity: S.opacity.satellite,
       attribution: '© RainViewer',
     });
@@ -1033,6 +1052,9 @@ function showFrame(idx, init = false) {
   if (!S.frames.length) return;
   idx = Math.max(0, Math.min(S.frames.length - 1, idx));
   S.frameIdx = idx;
+  // Auto-clear live mode if user has navigated away from the latest frame
+  if (S.liveMode && idx !== S.pastCount - 1) S.liveMode = false;
+  updateLiveBtn();
   const f = S.frames[idx];
 
   // Radar
@@ -1125,6 +1147,7 @@ function setupTLDrag() {
   }
   function drag(e) {
     if (!S.dragging) return;
+    S.liveMode = false;
     const idx = pctToIdx(px(e));
     if (idx !== S.frameIdx) showFrame(idx);
   }
@@ -1208,12 +1231,7 @@ function toggleLayer(name) {
       }
       $('orow-satellite').classList.toggle('show', S.layers.satellite);
       break;
-
-    case 'lightning':
-      S.layers.lightning ? startLightning() : stopLightning();
-      break;
-
-    default:
+default:
       if (OWM_LAYERS[name]) toggleOWM(name);
   }
 }
@@ -1283,176 +1301,7 @@ function toggleStorm(force) {
   S.radarLayer = null;
   showFrame(S.frameIdx, true);
 
-  // Auto-enable lightning in storm mode
-  if (S.stormMode && !S.layers.lightning) {
-    S.layers.lightning = false; // force toggle
-    toggleLayer('lightning');
-  }
-
   toast(S.stormMode ? '⛈ Storm Mode active' : '🌧 Storm Mode off');
-}
-
-/* ═════════════════════════════════════════════════════════════════════
-   LIGHTNING
-   — Tries a list of Blitzortung WebSocket endpoints in order.
-   — Simulation only starts if every endpoint fails; it never runs
-     alongside a live feed.
-════════════════════════════════════════════════════════════════════ */
-const UK = { latMin: 49.8, latMax: 60.9, lngMin: -8.2, lngMax: 2.0 };
-
-// Blitzortung publishes on several server/port combos; try them in order.
-// WebSocket connections to external servers only work when the page is served
-// over HTTPS. On file:// or http:// the browser blocks them with console errors,
-// so we detect the protocol and skip straight to simulation in those cases.
-const BTZ_ENDPOINTS = [
-  'wss://ws1.blitzortung.org:8069/',
-  'wss://ws2.blitzortung.org:8070/',
-  'wss://ws3.blitzortung.org:8071/',
-  'wss://ws4.blitzortung.org:8072/',
-];
-
-let btzLive        = false;   // true while a working WS is connected
-let btzAttempt     = 0;       // current endpoint index
-let btzReconnectT  = null;    // reconnect timer handle
-
-function startLightning() {
-  btzLive    = false;
-  btzAttempt = 0;
-  clearTimeout(btzReconnectT);
-  clearInterval(S.simInterval);
-
-  if (location.protocol === 'https:') {
-    // Served over HTTPS — Blitzortung WSS connections are allowed
-    connectBlitzortung();
-  } else {
-    // file:// or http:// — browsers block cross-origin WebSockets here.
-    // Skip to simulation; live data will work automatically on GitHub Pages.
-    console.info('Lightning: Blitzortung requires HTTPS — using simulation');
-    toast('⚡ Simulation mode — live lightning active when hosted on GitHub Pages');
-    startSim();
-  }
-}
-
-function stopLightning() {
-  btzLive = false;
-  clearTimeout(btzReconnectT);
-  clearInterval(S.simInterval);
-  if (S.wsLightning) {
-    try { S.wsLightning.onclose = null; S.wsLightning.close(); } catch {}
-    S.wsLightning = null;
-  }
-  S.boltMarkers.forEach(m => { try { MAP.removeLayer(m); } catch {} });
-  S.boltMarkers = [];
-}
-
-function connectBlitzortung() {
-  if (!S.layers.lightning) return;
-
-  // Cycled through every endpoint without success → fall back to simulation
-  if (btzAttempt >= BTZ_ENDPOINTS.length) {
-    console.info('All Blitzortung endpoints failed — using simulation');
-    toast('⚡ Live lightning unavailable — showing simulation');
-    startSim();
-    return;
-  }
-
-  const url = BTZ_ENDPOINTS[btzAttempt++];
-
-  let ws;
-  try { ws = new WebSocket(url); }
-  catch { scheduleNextEndpoint(); return; }
-
-  S.wsLightning = ws;
-
-  // If the socket doesn't open within 6 s, try the next endpoint
-  const openTimer = setTimeout(() => {
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    scheduleNextEndpoint();
-  }, 6000);
-
-  ws.onopen = () => {
-    clearTimeout(openTimer);
-    // Send UK bounding box filter
-    try {
-      ws.send(JSON.stringify({
-        west: UK.lngMin, east: UK.lngMax,
-        north: UK.latMax, south: UK.latMin,
-      }));
-    } catch {}
-  };
-
-  ws.onmessage = e => {
-    try {
-      const d = JSON.parse(e.data);
-      // Blitzortung sends {lat, lon, ...} per strike
-      if (typeof d.lat === 'number' && typeof d.lon === 'number') {
-        if (!btzLive) {
-          btzLive    = true;
-          btzAttempt = 0; // reset so future reconnects start from server 1
-          toast('⚡ Live lightning connected');
-        }
-        addBolt(d.lat, d.lon);
-      }
-    } catch {}
-  };
-
-  ws.onerror = () => {
-    clearTimeout(openTimer);
-    // onclose will fire next and handle retry
-  };
-
-  ws.onclose = () => {
-    clearTimeout(openTimer);
-    if (!S.layers.lightning) return;
-    if (btzLive) {
-      // Had a working connection — try to reconnect from the top after a pause
-      btzLive    = false;
-      btzAttempt = 0;
-      btzReconnectT = setTimeout(connectBlitzortung, 5000);
-    } else {
-      // Still in initial connection hunt — try the next endpoint immediately
-      scheduleNextEndpoint();
-    }
-  };
-}
-
-function scheduleNextEndpoint() {
-  if (!S.layers.lightning) return;
-  // Small delay between attempts so we don't hammer servers
-  btzReconnectT = setTimeout(connectBlitzortung, 500);
-}
-
-function startSim() {
-  if (!S.layers.lightning) return;
-  simStrike();
-  S.simInterval = setInterval(simStrike, CFG.BOLT_SIM_INT);
-}
-
-function simStrike() {
-  if (!S.layers.lightning || btzLive) return; // never sim over a live feed
-  const count = 1 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < count; i++) {
-    setTimeout(() => {
-      const lat = UK.latMin + Math.random() * (UK.latMax - UK.latMin);
-      const lng = UK.lngMin + Math.random() * (UK.lngMax - UK.lngMin);
-      addBolt(lat, lng);
-    }, i * 800);
-  }
-}
-
-function addBolt(lat, lng) {
-  if (!S.layers.lightning) return;
-  const icon = L.divIcon({
-    html: '<div class="bolt-marker">⚡</div>',
-    className: '', iconSize: [22, 22], iconAnchor: [11, 11],
-  });
-  const m = L.marker([lat, lng], { icon, interactive: false }).addTo(MAP);
-  S.boltMarkers.push(m);
-  setTimeout(() => {
-    try { MAP.removeLayer(m); } catch {}
-    S.boltMarkers = S.boltMarkers.filter(x => x !== m);
-  }, CFG.BOLT_FADE);
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -1653,6 +1502,7 @@ function setupKeys() {
       case '+': case '=': MAP.zoomIn(); break;
       case '-': case '_': MAP.zoomOut(); break;
       case '?':           openOverlay('ov-keys'); break;
+      case 'End':         goLive(); break;
       case 'Escape':      closeAll(); break;
     }
   });
@@ -1675,6 +1525,23 @@ function $(id) { return document.getElementById(id); }
 function ldMsg(m) { const el = $('ld-msg'); if (el) el.textContent = m; }
 function setUpdTime() {
   $('upd-time').textContent = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   LIVE MODE
+════════════════════════════════════════════════════════════════════ */
+function goLive() {
+  stopPlay();
+  S.liveMode = true;
+  showFrame(S.pastCount - 1);
+  toast('🔴 Showing latest data');
+}
+
+function updateLiveBtn() {
+  const btn = $('live-btn');
+  if (!btn) return;
+  const onLatest = S.frameIdx === S.pastCount - 1;
+  btn.classList.toggle('live', S.liveMode && onLatest);
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -1721,6 +1588,7 @@ function wireUI() {
   });
 
   // Float controls
+  $('live-btn').addEventListener('click', goLive);
   $('fc-in').addEventListener('click',   () => MAP.zoomIn());
   $('fc-out').addEventListener('click',  () => MAP.zoomOut());
   $('fc-home').addEventListener('click', () => MAP.flyTo(CFG.CENTER, CFG.ZOOM, { duration: 1 }));
