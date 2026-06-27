@@ -893,7 +893,7 @@ const CFG = {
   TILE_HOST:     'https://tilecache.rainviewer.com',
   NOM:           'https://nominatim.openstreetmap.org/search',
   OWM_TILE:      'https://tile.openweathermap.org/map',
-  OWM_KEY:       '',           // ← add your free OpenWeatherMap API key here
+  OWM_KEY:       '028e10a30d69273c6bd225dd4e197499', // OpenWeatherMap key (local use only)
   FRAME_MS:      500,          // base ms per frame at 1×
   LOOP_PAUSE:    1800,         // ms pause at loop end
   REFRESH:       600_000,      // 10-min auto-refresh
@@ -1247,10 +1247,17 @@ function toggleOWM(name) {
       if (row) row.classList.remove('on');
       return;
     }
-    const l = L.tileLayer(
-      `${CFG.OWM_TILE}/${OWM_LAYERS[name]}/{z}/{x}/{y}.png?appid=${CFG.OWM_KEY}`,
-      { opacity: 0.6, attribution: '© OpenWeatherMap' }
-    );
+    // OWM 2.0 op-codes (current free tier); fall back to legacy 1.0 tiles on error
+    const OWM2_OP = { wind: 'WND', pressure: 'APM', temp: 'TA2', clouds: 'CL' };
+    const url20 = `https://maps.openweathermap.org/maps/2.0/weather/${OWM2_OP[name]}/{z}/{x}/{y}?appid=${CFG.OWM_KEY}&opacity=0.6&fill_bound=true`;
+    const url10 = `${CFG.OWM_TILE}/${OWM_LAYERS[name]}/{z}/{x}/{y}.png?appid=${CFG.OWM_KEY}`;
+    const l = L.tileLayer(url20, { opacity: 0.6, attribution: '© OpenWeatherMap' });
+    let swapped = false;
+    l.on('tileerror', () => {
+      if (swapped) return;
+      swapped = true;
+      l.setUrl(url10);
+    });
     l.addTo(MAP);
     OWML[name] = l;
   } else {
