@@ -638,6 +638,51 @@
       #floatc { gap: 4px; }
       .fc-btn { width: 34px; height: 34px; font-size: 16px; }
     }
+    /* ── Storm tracker ─────────────────────────────────────── */
+    .storm-hint {
+      font-size: 11px; line-height: 1.5; color: var(--text-dim);
+      padding: 6px 10px 2px; opacity: 0.85;
+    }
+    .storm-dot {
+      width: 34px; height: 34px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; box-shadow: 0 0 0 2px rgba(0,0,0,0.4);
+      animation: stormPulse 2s ease-out infinite;
+    }
+    .storm-dot.sev { background: rgba(255,50,50,0.85); box-shadow: 0 0 0 2px #ff4040, 0 0 18px 4px rgba(255,40,40,0.6); }
+    .storm-dot.hvy { background: rgba(255,150,40,0.85); box-shadow: 0 0 0 2px #ffa030, 0 0 14px 3px rgba(255,150,40,0.5); }
+    .storm-dot.mod { background: rgba(90,160,255,0.8); }
+    @keyframes stormPulse {
+      0%   { transform: scale(0.92); }
+      50%  { transform: scale(1.06); }
+      100% { transform: scale(0.92); }
+    }
+    .storm-pop { font-size: 12px; min-width: 180px; }
+    .sp-title { font-weight: 700; font-size: 13px; margin-bottom: 5px; }
+    .sp-title.sev { color: #ff5555; }
+    .sp-title.hvy { color: #ffaa44; }
+    .sp-row { margin: 2px 0; color: var(--text); }
+    .sp-foot { margin-top: 6px; font-size: 10px; color: var(--text-dim); opacity: 0.8; font-style: italic; }
+    #storm-alert {
+      position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 5000; display: flex; align-items: center; gap: 10px;
+      padding: 10px 14px; border-radius: 10px; max-width: 92vw;
+      font-size: 13px; color: #fff; backdrop-filter: blur(8px);
+      box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+      animation: alertDrop 0.4s ease;
+    }
+    #storm-alert.sev { background: rgba(190,30,30,0.92); border: 1px solid #ff5050; }
+    #storm-alert.hvy { background: rgba(190,110,20,0.92); border: 1px solid #ffaa40; }
+    #storm-alert .sa-ic { font-size: 18px; }
+    #storm-alert button {
+      background: rgba(255,255,255,0.18); border: none; color: #fff;
+      width: 22px; height: 22px; border-radius: 50%; cursor: pointer; font-size: 12px;
+    }
+    #storm-alert button:hover { background: rgba(255,255,255,0.3); }
+    @keyframes alertDrop {
+      from { opacity: 0; transform: translateX(-50%) translateY(-12px); }
+      to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
   </style>
 </head>
 <body>
@@ -724,22 +769,13 @@
     </div>
 
     <div class="layer-group">
-      <div class="layer-group-label">Overlays</div>
-      <div class="layer-item" data-layer="wind">
-        <span class="l-emoji">💨</span><span class="l-name">Wind Speed</span>
-        <button class="tog" data-tog="wind"></button>
+      <div class="layer-group-label">Storm Tracking</div>
+      <div class="layer-item" data-layer="stormtrack" id="stormtrack-row">
+        <span class="l-emoji">⚡</span><span class="l-name">Track Storm Cells</span>
+        <button class="tog" data-tog="stormtrack" id="btn-storm-track"></button>
       </div>
-      <div class="layer-item" data-layer="pressure">
-        <span class="l-emoji">🔵</span><span class="l-name">Air Pressure</span>
-        <button class="tog" data-tog="pressure"></button>
-      </div>
-      <div class="layer-item" data-layer="temp">
-        <span class="l-emoji">🌡</span><span class="l-name">Temperature</span>
-        <button class="tog" data-tog="temp"></button>
-      </div>
-      <div class="layer-item" data-layer="clouds">
-        <span class="l-emoji">☁</span><span class="l-name">Cloud Cover</span>
-        <button class="tog" data-tog="clouds"></button>
+      <div class="storm-hint">
+        Detects heavy/severe rain cells, projects ~30&nbsp;min path, and alerts if one is heading toward your location. Use 📍 to set your location.
       </div>
     </div>
 
@@ -892,8 +928,6 @@ const CFG = {
   RV_API:        'https://api.rainviewer.com/public/weather-maps.json',
   TILE_HOST:     'https://tilecache.rainviewer.com',
   NOM:           'https://nominatim.openstreetmap.org/search',
-  OWM_TILE:      'https://tile.openweathermap.org/map',
-  OWM_KEY:       '028e10a30d69273c6bd225dd4e197499', // OpenWeatherMap key (local use only)
   FRAME_MS:      500,          // base ms per frame at 1×
   LOOP_PAUSE:    1800,         // ms pause at loop end
   REFRESH:       600_000,      // 10-min auto-refresh
@@ -901,19 +935,366 @@ const CFG = {
   COLOR_STORM:   6,
 };
 
-const OWM_LAYERS = {
-  wind:     'wind_new',
-  pressure: 'pressure_new',
-  temp:     'temp_new',
-  clouds:   'clouds_new',
+/* ══════════════════════════════════════════════════════════════════════
+   STORM TRACKER ENGINE  (keyless — reads RainViewer radar tile pixels)
+   ----------------------------------------------------------------------
+   Pipeline:
+   1. Read RainViewer radar tile pixels over the visible map (already-loaded
+      frames — no extra API calls) and map colour -> intensity.
+   2. Cluster intense pixels into "cells" for the current + a prior frame.
+   3. Match cells across the two frames by proximity -> velocity vector.
+   4. Project each cell forward ~30 min (constant velocity extrapolation).
+   5. If a HEAVY/SEVERE cell's projected path passes near the user's
+      location, raise an alert with ETA.
+   NOTE: projection is simple extrapolation, NOT a meteorological forecast.
+   ══════════════════════════════════════════════════════════════════════ */
+
+const STORM = {
+  // intensity thresholds in mm/h (precipitation rate)
+  HEAVY:  4,      // mm/h — heavy rain
+  SEVERE: 10,     // mm/h — severe / likely thunderstorm core
+  PROJECT_MIN: 30,        // minutes to project ahead
+  ALERT_RADIUS_KM: 25,    // how close a path must pass to user to alert
+  REFRESH_MS: 5 * 60_000, // re-scan cadence
+  enabled: false,
+  timer: null,
+  cells: [],              // current detected/tracked cells
+  markers: [],            // leaflet markers/paths on map
+  userLatLng: null,       // {lat,lng} if known
 };
+
+function kmBetween(a, b) {
+  const R = 6371, toR = d => d * Math.PI / 180;
+  const dLat = toR(b.lat - a.lat), dLng = toR(b.lng - a.lng);
+  const s = Math.sin(dLat/2)**2 + Math.cos(toR(a.lat))*Math.cos(toR(b.lat))*Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+function bearingDeg(a, b) {
+  const toR = d => d*Math.PI/180, toD = r => r*180/Math.PI;
+  const y = Math.sin(toR(b.lng-a.lng))*Math.cos(toR(b.lat));
+  const x = Math.cos(toR(a.lat))*Math.sin(toR(b.lat)) - Math.sin(toR(a.lat))*Math.cos(toR(b.lat))*Math.cos(toR(b.lng-a.lng));
+  return (toD(Math.atan2(y, x)) + 360) % 360;
+}
+function compass(deg) {
+  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(deg/45)%8];
+}
+// project a point forward given bearing (deg) + distance (km)
+function projectPoint(p, brg, km) {
+  const R = 6371, toR = d => d*Math.PI/180, toD = r => r*180/Math.PI;
+  const d = km / R, b = toR(brg), lat1 = toR(p.lat), lng1 = toR(p.lng);
+  const lat2 = Math.asin(Math.sin(lat1)*Math.cos(d) + Math.cos(lat1)*Math.sin(d)*Math.cos(b));
+  const lng2 = lng1 + Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(lat1), Math.cos(d)-Math.sin(lat1)*Math.sin(lat2));
+  return { lat: toD(lat2), lng: toD(lng2) };
+}
+// shortest distance (km) from point P to segment AB — for path-vs-user test
+function distPointToSegmentKm(p, a, b) {
+  // local equirectangular approx in km
+  const toKm = 111, latc = Math.cos((a.lat)*Math.PI/180);
+  const ax=0, ay=0;
+  const bx=(b.lng-a.lng)*toKm*latc, by=(b.lat-a.lat)*toKm;
+  const px=(p.lng-a.lng)*toKm*latc, py=(p.lat-a.lat)*toKm;
+  const dx=bx-ax, dy=by-ay;
+  const len2 = dx*dx+dy*dy;
+  let t = len2 ? ((px-ax)*dx+(py-ay)*dy)/len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx=ax+t*dx, cy=ay+t*dy;
+  return Math.hypot(px-cx, py-cy);
+}
+
+// Fetch precipitation grid for a given past-hours offset (0 = now).
+// Returns array of {lat,lng,precip}.
+// ── Radar-pixel storm detection (no data API — reads RainViewer tiles) ──
+// RainViewer scheme 2 ("Universal Blue") intensity ramp, approximated:
+// light rain = blues, heavier = cyan/green, intense = yellow/orange, severe = red.
+// We classify by hue/brightness into an mm/h-ish intensity score.
+
+function rvPixelIntensity(r, g, b, a) {
+  if (a < 40) return 0;                 // transparent = no echo
+  // crude but effective mapping for scheme 2
+  // reds/oranges (severe)
+  if (r > 180 && g < 120 && b < 90)  return 14;   // red core
+  if (r > 200 && g > 120 && b < 90)  return 9;    // orange
+  if (r > 200 && g > 190 && b < 110) return 6;    // yellow
+  if (g > 150 && b < 140 && r < 160) return 4;    // green
+  if (b > 150 && g > 150)            return 2;    // cyan
+  if (b > 130 && r < 120)            return 1;    // blue (light)
+  return 0.5;
+}
+
+// Convert lat/lng <-> world pixel coords at a given zoom (Web Mercator).
+function lngLatToWorld(lat, lng, z) {
+  const s = 256 * Math.pow(2, z);
+  const x = (lng + 180) / 360 * s;
+  const sinLat = Math.sin(lat * Math.PI / 180);
+  const y = (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * s;
+  return { x, y };
+}
+function worldToLngLat(x, y, z) {
+  const s = 256 * Math.pow(2, z);
+  const lng = x / s * 360 - 180;
+  const n = Math.PI - 2 * Math.PI * y / s;
+  const lat = 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  return { lat, lng };
+}
+
+// Load one radar tile image (CORS-enabled). Resolves to Image or null on failure.
+function loadTile(url) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+// Scan one radar frame's tiles over the viewport -> array of {lat,lng,intensity}.
+// Downsamples pixels to keep the point count manageable.
+async function scanFrameTiles(frame) {
+  const z = Math.min(Math.max(MAP.getZoom() - 1 | 0, 3), 7); // RainViewer native range
+  const tileSize = 512;
+  const b = MAP.getBounds();
+  const nw = lngLatToWorld(b.getNorth(), b.getWest(), z);
+  const se = lngLatToWorld(b.getSouth(), b.getEast(), z);
+  const x0 = Math.floor(nw.x / tileSize), x1 = Math.floor(se.x / tileSize);
+  const y0 = Math.floor(nw.y / tileSize), y1 = Math.floor(se.y / tileSize);
+
+  const tiles = [];
+  for (let tx = x0; tx <= x1; tx++)
+    for (let ty = y0; ty <= y1; ty++)
+      tiles.push({ tx, ty });
+  // cap tiles to avoid loading a huge area
+  if (tiles.length > 16) tiles.length = 16;
+
+  const points = [];
+  const STEP = 16; // sample every 16px to downsample
+  let tainted = false;
+
+  await Promise.all(tiles.map(async ({ tx, ty }) => {
+    const url = `${frame.host}${frame.path}/512/${z}/${tx}/${ty}/${S.scheme}/1_1.png`;
+    const img = await loadTile(url);
+    if (!img) return;
+    const cv = document.createElement('canvas');
+    cv.width = tileSize; cv.height = tileSize;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, tileSize, tileSize);
+    let data;
+    try { data = ctx.getImageData(0, 0, tileSize, tileSize).data; }
+    catch (e) { tainted = true; return; }  // CORS taint
+    for (let py = 0; py < tileSize; py += STEP) {
+      for (let px = 0; px < tileSize; px += STEP) {
+        const i = (py * tileSize + px) * 4;
+        const intensity = rvPixelIntensity(data[i], data[i+1], data[i+2], data[i+3]);
+        if (intensity >= STORM.HEAVY) {
+          const wx = tx * tileSize + px, wy = ty * tileSize + py;
+          const { lat, lng } = worldToLngLat(wx, wy, z);
+          points.push({ lat, lng, intensity });
+        }
+      }
+    }
+  }));
+
+  if (tainted && !points.length) throw new Error('CORS_TAINT');
+  return points;
+}
+
+// Cluster nearby hot points into cells (distance-based, since these are
+// scattered lat/lngs rather than a fixed grid).
+function clusterPoints(points) {
+  const cells = [];
+  const used = new Array(points.length).fill(false);
+  const RADIUS_KM = 18;
+  for (let i = 0; i < points.length; i++) {
+    if (used[i]) continue;
+    const members = [points[i]]; used[i] = true;
+    for (let j = i + 1; j < points.length; j++) {
+      if (used[j]) continue;
+      if (kmBetween(points[i], points[j]) <= RADIUS_KM) { members.push(points[j]); used[j] = true; }
+    }
+    let sw = 0, slat = 0, slng = 0, peak = 0;
+    members.forEach(m => { const w = m.intensity; sw += w; slat += m.lat*w; slng += m.lng*w; peak = Math.max(peak, m.intensity); });
+    // ignore tiny specks (noise)
+    if (members.length < 2) continue;
+    cells.push({ lat: slat/sw, lng: slng/sw, peak, size: members.length });
+  }
+  return cells;
+}
+
+async function stormScan() {
+  if (!STORM.enabled || !MAP) return;
+  if (!S.frames.length) { stormToast('Radar not loaded yet'); return; }
+  stormToast('Scanning radar for storm cells…');
+  try {
+    const nowIdx  = Math.min(S.pastCount - 1, S.frames.length - 1);
+    const prevIdx = Math.max(0, nowIdx - 2);  // ~2 frames back (~20 min)
+    const nowFrame  = S.frames[nowIdx];
+    const prevFrame = S.frames[prevIdx];
+    const minsGap = Math.max(10, Math.round((nowFrame.time - prevFrame.time) / 60));
+
+    const nowPts = await scanFrameTiles(nowFrame);
+    const nowCells = clusterPoints(nowPts);
+
+    // only scan previous frame if we found something to track
+    if (nowCells.length) {
+      const prevPts = await scanFrameTiles(prevFrame);
+      const prevCells = clusterPoints(prevPts);
+      STORM.cells = stormMatch(nowCells, prevCells, minsGap);
+    } else {
+      STORM.cells = [];
+    }
+
+    stormRender();
+    if (!STORM.cells.length) stormToast('No significant storm cells in view');
+    else stormToast(`${STORM.cells.length} cell${STORM.cells.length>1?'s':''} tracked`);
+  } catch (e) {
+    if (e.message === 'CORS_TAINT')
+      stormToast('⚠️ Radar tiles blocked pixel access (CORS) — cannot scan');
+    else
+      stormToast('Storm scan failed');
+    console.warn('storm scan', e);
+  }
+}
+
+// Match cells between two time steps -> attach velocity to "now" cells.
+function stormMatch(nowCells, prevCells, minutesGap) {
+  nowCells.forEach(nc => {
+    let best=null, bestD=Infinity;
+    prevCells.forEach(pc => {
+      const d = kmBetween(nc, pc);
+      if (d < bestD) { bestD=d; best=pc; }
+    });
+    if (best && bestD < 60) { // plausible same cell within 60km
+      nc.from = best;
+      nc.speedKmh = bestD / (minutesGap/60);
+      nc.bearing = bearingDeg(best, nc);
+    } else {
+      nc.speedKmh = 0; nc.bearing = 0;
+    }
+  });
+  return nowCells;
+}
+
+function stormSeverity(peak) {
+  if (peak >= STORM.SEVERE) return { label:'SEVERE', cls:'sev' };
+  if (peak >= STORM.HEAVY)  return { label:'HEAVY',  cls:'hvy' };
+  return { label:'MODERATE', cls:'mod' };
+}
+
+function stormClearMarkers() {
+  STORM.markers.forEach(m => { if (MAP.hasLayer(m)) MAP.removeLayer(m); });
+  STORM.markers = [];
+}
+
+function stormRender() {
+  stormClearMarkers();
+  let alertCell = null, alertInfo = null;
+
+  STORM.cells.forEach(cell => {
+    const sev = stormSeverity(cell.peak);
+    const moving = cell.speedKmh > 1;
+    const proj = moving
+      ? projectPoint(cell, cell.bearing, cell.speedKmh * (STORM.PROJECT_MIN/60))
+      : null;
+
+    // cell marker
+    const icon = L.divIcon({
+      className: 'storm-cell-icon',
+      html: `<div class="storm-dot ${sev.cls}"><span>${sev.label==='SEVERE'?'⚡':'🌧'}</span></div>`,
+      iconSize: [34,34], iconAnchor:[17,17],
+    });
+    const mk = L.marker([cell.lat, cell.lng], { icon }).addTo(MAP);
+
+    // projected path line + arrowhead
+    if (proj) {
+      const line = L.polyline([[cell.lat,cell.lng],[proj.lat,proj.lng]], {
+        color: sev.cls==='sev' ? '#ff4040' : '#ffa030',
+        weight: 3, opacity: 0.8, dashArray: '6 6',
+      }).addTo(MAP);
+      const head = L.circleMarker([proj.lat,proj.lng], {
+        radius:4, color: sev.cls==='sev' ? '#ff4040':'#ffa030', fillOpacity:1,
+      }).addTo(MAP);
+      STORM.markers.push(line, head);
+    }
+
+    // user-path check (only HEAVY/SEVERE alert)
+    let etaTxt = '';
+    if (STORM.userLatLng && proj && cell.peak >= STORM.HEAVY) {
+      const d = distPointToSegmentKm(STORM.userLatLng, cell, proj);
+      if (d <= STORM.ALERT_RADIUS_KM) {
+        const distToUser = kmBetween(cell, STORM.userLatLng);
+        const etaMin = cell.speedKmh > 1 ? Math.round(distToUser / cell.speedKmh * 60) : null;
+        etaTxt = etaMin != null ? `<br><b style="color:#ff6060">⚠ Heading your way — ETA ~${etaMin} min</b>` : '';
+        if (!alertCell || cell.peak > alertCell.peak) {
+          alertCell = cell;
+          alertInfo = { sev, etaMin, distToUser };
+        }
+      }
+    }
+
+    const popup = `<div class="storm-pop">
+      <div class="sp-title ${sev.cls}">${sev.label==='SEVERE'?'⚡ Severe Cell':'🌧 Heavy Cell'}</div>
+      <div class="sp-row">Intensity: <b>${cell.peak.toFixed(1)} mm/h</b></div>
+      <div class="sp-row">Movement: <b>${moving ? `${Math.round(cell.speedKmh)} km/h ${compass(cell.bearing)}` : 'near-stationary'}</b></div>
+      <div class="sp-row">Cell size: <b>${cell.size} grid pts</b></div>
+      ${etaTxt}
+      <div class="sp-foot">Projected ${STORM.PROJECT_MIN} min · extrapolated, not a forecast</div>
+    </div>`;
+    mk.bindPopup(popup);
+    STORM.markers.push(mk);
+  });
+
+  // banner alert
+  stormBanner(alertCell, alertInfo);
+}
+
+function stormBanner(cell, info) {
+  let el = document.getElementById('storm-alert');
+  if (!cell) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'storm-alert';
+    document.body.appendChild(el);
+  }
+  const eta = info.etaMin != null ? `ETA ~${info.etaMin} min` : 'approaching';
+  el.className = info.sev.cls === 'sev' ? 'sev' : 'hvy';
+  el.innerHTML = `<span class="sa-ic">${info.sev.cls==='sev'?'⚡':'⚠'}</span>
+    <span><b>${info.sev.label} cell heading your way</b> — ${cell.peak.toFixed(1)} mm/h · ${eta}</span>
+    <button onclick="document.getElementById('storm-alert').remove()">✕</button>`;
+}
+
+function stormToast(msg) {
+  if (typeof toast === 'function') toast(msg);
+}
+
+function stormSetUser(lat, lng) {
+  STORM.userLatLng = { lat, lng };
+  if (STORM.enabled) stormRender();
+}
+
+function stormToggle(on) {
+  STORM.enabled = on != null ? on : !STORM.enabled;
+  const btn = document.getElementById('btn-storm-track');
+  if (btn) btn.classList.toggle('on', STORM.enabled);
+  if (STORM.enabled) {
+    stormScan();
+    clearInterval(STORM.timer);
+    STORM.timer = setInterval(stormScan, STORM.REFRESH_MS);
+    // rescan after user finishes panning
+    MAP.on('moveend', STORM._move = () => { clearTimeout(STORM._mt); STORM._mt = setTimeout(stormScan, 900); });
+  } else {
+    clearInterval(STORM.timer);
+    if (STORM._move) MAP.off('moveend', STORM._move);
+    stormClearMarkers();
+    stormBanner(null);
+  }
+}
+
 
 /* ── State ──────────────────────────────────────────────────────────── */
 let MAP = null;
 const BASE = {};          // base tile layers keyed by name
 const RCACHE = {};        // radar tile layer cache  key = `${time}_${scheme}`
 const SCACHE = {};        // satellite tile layer cache
-const OWML = {};          // active OWM tile layers
 
 const S = {
   frames:       [],       // {time, path, host, isFc}
@@ -927,7 +1308,7 @@ const S = {
   scheme:       CFG.COLOR_NORMAL,
   layers: {
     radar: true, satellite: false,
-    wind: false, pressure: false, temp: false, clouds: false,
+    stormtrack: false,
   },
   opacity: { radar: 0.80, satellite: 0.60 },
   radarLayer:   null,
@@ -1231,37 +1612,8 @@ function toggleLayer(name) {
       }
       $('orow-satellite').classList.toggle('show', S.layers.satellite);
       break;
-default:
-      if (OWM_LAYERS[name]) toggleOWM(name);
-  }
-}
-
-function toggleOWM(name) {
-  if (S.layers[name]) {
-    if (!CFG.OWM_KEY) {
-      toast('⚠️ Add your free OWM key to CFG.OWM_KEY for this layer');
-      S.layers[name] = false;
-      const t = document.querySelector(`[data-tog="${name}"]`);
-      if (t) t.classList.remove('on');
-      const row = document.querySelector(`.layer-item[data-layer="${name}"]`);
-      if (row) row.classList.remove('on');
-      return;
-    }
-    // OWM 2.0 op-codes (current free tier); fall back to legacy 1.0 tiles on error
-    const OWM2_OP = { wind: 'WND', pressure: 'APM', temp: 'TA2', clouds: 'CL' };
-    const url20 = `https://maps.openweathermap.org/maps/2.0/weather/${OWM2_OP[name]}/{z}/{x}/{y}?appid=${CFG.OWM_KEY}&opacity=0.6&fill_bound=true`;
-    const url10 = `${CFG.OWM_TILE}/${OWM_LAYERS[name]}/{z}/{x}/{y}.png?appid=${CFG.OWM_KEY}`;
-    const l = L.tileLayer(url20, { opacity: 0.6, attribution: '© OpenWeatherMap' });
-    let swapped = false;
-    l.on('tileerror', () => {
-      if (swapped) return;
-      swapped = true;
-      l.setUrl(url10);
-    });
-    l.addTo(MAP);
-    OWML[name] = l;
-  } else {
-    if (OWML[name]) { MAP.removeLayer(OWML[name]); delete OWML[name]; }
+    default:
+      if (name === 'stormtrack') stormToggle(S.layers[name]);
   }
 }
 
@@ -1398,6 +1750,7 @@ function placeUserDot(lat, lng) {
   const icon = L.divIcon({ html: '<div class="user-dot"></div>', className: '', iconSize: [16, 16], iconAnchor: [8, 8] });
   S.userMarker = L.marker([lat, lng], { icon, zIndexOffset: 2000 }).addTo(MAP);
   S.userMarker.bindPopup('<b>Your location</b>');
+  stormSetUser(lat, lng);
 }
 
 function placePin(lat, lng, name) {
@@ -1405,6 +1758,7 @@ function placePin(lat, lng, name) {
   const icon = L.divIcon({ html: '<div class="user-dot"></div>', className: '', iconSize: [16, 16], iconAnchor: [8, 8] });
   S.userMarker = L.marker([lat, lng], { icon, zIndexOffset: 2000 }).addTo(MAP);
   S.userMarker.bindPopup(`<b>${name}</b>`);
+  stormSetUser(lat, lng);
 }
 
 /* ═════════════════════════════════════════════════════════════════════
